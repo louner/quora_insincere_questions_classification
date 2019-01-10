@@ -46,6 +46,10 @@ from pdb import set_trace
 
 from pytorch_pretrained_bert import BertTokenizer, BertModel
 
+import matplotlib.pyplot as plt
+from IPython import display
+from time import time
+
 class TokToID(object):
     def __init__(self, tokenizer=None):
         if tokenizer is None:
@@ -111,3 +115,153 @@ class QuoraInsinereQustion(Dataset):
                 raise
         return sample
 
+class Metrics:
+    def __init__(self):
+        self.train_metrics = pd.DataFrame()
+        self.val_metrics = pd.DataFrame()
+        
+    def append_row(self, df, row):
+        row = pd.DataFrame([row], columns=row.keys())
+        return pd.concat([df, row], axis=0)
+
+    def add_more_metrics(self, metric):
+        if 'Precision' in metric:
+            metric['Precision'] = metric['Precision'][1].item()
+
+        if 'Recall' in metric:
+            metric['Recall'] = metric['Recall'][1].item()
+
+        f1 = 2*(metric['Recall']*metric['Precision'])/((metric['Recall'] + metric['Precision']+1e-20))
+        if f1 > 1:
+            f1 = 0
+        metric['F1'] = f1
+        
+    def add_train(self, metric):
+        self.add_more_metrics(metric)
+        self.train_metrics = self.append_row(self.train_metrics, metric)
+        
+    def add_val(self, metric):
+        self.add_more_metrics(metric)
+        self.val_metrics = self.append_row(self.val_metrics, metric)
+
+    def is_best_val(self):
+        return self.val_metrics['accuracy'].max() == self.val_metrics['accuracy'].iloc[-1]
+
+def plot_metrics(metrics):
+    plt.gcf().clear()
+    #plt.plot(metrics.train_metrics['Accuracy'].values, color='r')
+    plt.plot(metrics.train_metrics['F1'].values, color='r')
+    plt.plot(metrics.train_metrics['Loss'].values, color='g')
+    #plt.plot(metrics.train_metrics['Precision'].values, color='y')
+    #plt.plot(metrics.train_metrics['Recall'].values, color='b')
+
+    plt.plot(metrics.val_metrics['Loss'].values, color='b')
+    #plt.plot(metrics.val_metrics['Accuracy'].values, color='y')
+    plt.plot(metrics.val_metrics['F1'].values, color='y')
+    display.display(plt.gcf())
+    display.clear_output(wait=True)
+
+class CNN(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        self.bert_model = BertModel.from_pretrained('bert-base-uncased')
+        
+        self.convs = []
+        for kernel_weight in kernel_weights:
+            conv = torch.nn.Conv2d(
+                in_channels=1,
+                out_channels=out_channels,
+                kernel_size=(kernel_weight, bert_hidden_size)
+            )
+            self.convs.append(conv)
+            setattr(self, 'conv-%d'%(kernel_weight), conv)
+        
+        self.dropout = torch.nn.Dropout(p=0.5)
+        
+        self.fc1 = torch.nn.Linear(
+            in_features=len(kernel_weights)*out_channels,
+            out_features=2
+        )
+        
+        self.softmax = torch.nn.Softmax(dim=1)
+        
+    def forward(self, X):
+        #set_trace()
+        segment_tensor = torch.zeros_like(X)
+        # 12, sentence_length, 768
+        encoder, _ = self.bert_model(X, segment_tensor)
+
+        last_layer = encoder[-1]
+        # for cnn (N, C, H, W) format, append in_channel in dim=1
+        last_layer = torch.unsqueeze(last_layer, 1)
+        #last_layer = self.dropout(last_layer)
+        
+        conv_outs = []
+        for conv in self.convs:
+            # batch_size, out_channels, sentence_length-kernel_weight+1, 1
+            conv_out = conv(last_layer)
+            # batch_size, out_channels, 1
+            # dim=2 is maxed out
+            conv_out, _ = torch.max(conv_out, dim=2)
+            
+            conv_outs.append(conv_out)
+
+        # batch_size, out_channels*len(kernel_weights), 1
+        conv_out = torch.cat(conv_outs, dim=1)
+        conv_out = torch.squeeze(conv_out)
+        # batch_size, out_channels*len(kernel_weights)
+        conv_out = conv_out.view(X.shape[0], -1)
+        
+        fc_out = self.fc1(conv_out)
+        logits = self.softmax(fc_out)
+        
+        return logits
+            
+def build_dl(fpath, frac=0.00001):
+    dataset = QuoraInsinereQustion(fpath)
+    dataset.df = dataset.df.sample(frac=frac)
+    dl = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers
+    )
+    return dl
+
+if __name__ == '__main__':
+    from torch.nn import CrossEntropyLoss
+    from torch.optim import Adam, SGD
+
+    train_dl = build_dl('data/train', frac=0.0001)
+    val_dl = build_dl('data/val', frac=0.0001)
+
+    model = CNN()
+    #loss = CrossEntropyLoss()
+    loss = CrossEntropyLoss(weight=torch.Tensor([1, 16]))
+    trainable_tensors = [p[1] for p in model.named_parameters() if p[0].startswith('conv') or p[0].startswith('fc')]
+    optimizer = Adam(params=trainable_tensors, lr=learning_rate)
+
+    from ignite.engine import create_supervised_trainer, Events, create_supervised_evaluator
+    from ignite.metrics import Loss, Accuracy, Precision, Recall
+    trainer = create_supervised_trainer(model=model, optimizer=optimizer, loss_fn=loss)
+    evaluator = create_supervised_evaluator(model=model, metrics={'Loss': Loss(loss), 'Accuracy': Accuracy(), 'Precision': Precision(), 'Recall': Recall()})
+    metrics = Metrics()
+
+    epoch_st = time()
+    @trainer.on(Events.EPOCH_COMPLETED)
+    def log_training_loss(trainer):
+        evaluator.run(train_dl)
+        metrics.add_train(evaluator.state.metrics)
+
+        global epoch_st
+        elasped_time = int(time()-epoch_st)
+        epoch_st = time()
+
+        print(f"epoch {trainer.state.epoch} {evaluator.state.metrics} {elasped_time}")
+        evaluator.run(val_dl)
+        metrics.add_val(evaluator.state.metrics)
+        
+        plot_metrics(metrics)
+
+    trainer.run(train_dl, max_epochs=100)
