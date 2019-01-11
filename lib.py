@@ -1,3 +1,4 @@
+'''
 import pandas as pd
 
 from sklearn.model_selection import train_test_split
@@ -33,6 +34,7 @@ def build_embed_layer():
     embeddings = glove.iloc[:, 1:].values
     embed_layer = Embedding.from_pretrained(torch.Tensor(embeddings))
     return word2id, embed_layer
+'''
 
 from torch.nn import Embedding
 import torch
@@ -49,6 +51,16 @@ from pytorch_pretrained_bert import BertTokenizer, BertModel
 import matplotlib.pyplot as plt
 from IPython import display
 from time import time
+
+word2id_fpath = 'data/word2id'
+batch_size = 256
+shuffle = True
+num_workers = 4
+sentence_length = 32
+bert_hidden_size = 768
+learning_rate = 1e-3
+kernel_weights = [2,3,4]
+out_channels = 8
 
 class TokToID(object):
     def __init__(self, tokenizer=None):
@@ -166,6 +178,8 @@ class CNN(torch.nn.Module):
         super().__init__()
         
         self.bert_model = BertModel.from_pretrained('bert-base-uncased')
+        for p in self.bert_model.parameters():
+            p.requires_grad = False
         
         self.convs = []
         for kernel_weight in kernel_weights:
