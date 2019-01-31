@@ -1,93 +1,81 @@
-from torch.nn import Embedding
-import torch
-import numpy as np
-import pandas as pd
-import json
-from pdb import set_trace
 from lib import *
-from pytorch_pretrained_bert import BertTokenizer, BertModel
 
-word2id_fpath = 'data/word2id'
-batch_size = 32
-shuffle = True
-num_workers = 4
-sentence_length = 32
-bert_hidden_size = 768
-learning_rate = 1e-3
+class TokToID(object):
+    def __init__(self, tokenizer=None):
+        if tokenizer is None:
+            tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.tokenizer = tokenizer
+    
+    def toID(self, sentence):
+        try:
+            #set_trace()
+            toks = self.tokenizer.tokenize(sentence)
+            ids = self.tokenizer.convert_tokens_to_ids(toks)
+            return ids
+        except:
+            set_trace()
+        
+    def __call__(self, item):
+        item[0] = self.toID(item[0])
+        return item
 
-class CNN(torch.nn.Module):
+class CNNBERT(torch.nn.Module):
     def __init__(self):
         super().__init__()
         
         self.bert_model = BertModel.from_pretrained('bert-base-uncased')
+        for p in self.bert_model.parameters():
+            p.requires_grad = False
         
-        self.cnn1 = torch.nn.Conv2d(
-            in_channels=1,
-            out_channels=32,
-            kernel_size=(4,bert_hidden_size)
-        )
-        
-        self.pool1 = torch.nn.MaxPool2d(
-            kernel_size=(2,2)
-        )
+        self.convs = []
+        for kernel_weight in kernel_weights:
+            conv = torch.nn.Conv2d(
+                in_channels=1,
+                out_channels=out_channels,
+                kernel_size=(kernel_weight, bert_hidden_size)
+            )
+            self.convs.append(conv)
+            setattr(self, 'conv-%d'%(kernel_weight), conv)
         
         self.dropout = torch.nn.Dropout(p=0.5)
         
         self.fc1 = torch.nn.Linear(
-            in_features=1984,
+            in_features=len(kernel_weights)*out_channels,
             out_features=2
         )
         
-        self.softmax = torch.nn.Softmax()
+        #self.softmax = torch.nn.Softmax(dim=1)
         
     def forward(self, X):
         #set_trace()
         segment_tensor = torch.zeros_like(X)
+        # 12, sentence_length, 768
         encoder, _ = self.bert_model(X, segment_tensor)
 
         last_layer = encoder[-1]
+        # for cnn (N, C, H, W) format, append in_channel in dim=1
         last_layer = torch.unsqueeze(last_layer, 1)
-
-        cnn1_out = self.cnn1(last_layer)
-        pool1_out = self.pool1(cnn1_out)
-
-        pool1_out = pool1_out.view(batch_size, -1)
+        #last_layer = self.dropout(last_layer)
         
-        pool1_out = self.dropout(pool1_out)
-        pool1_out = self.fc1(pool1_out)
-        logits = self.softmax(pool1_out)
+        conv_outs = []
+        for conv in self.convs:
+            # batch_size, out_channels, sentence_length-kernel_weight+1, 1
+            conv_out = conv(last_layer)
+            # batch_size, out_channels, 1
+            # dim=2 is maxed out
+            conv_out, _ = torch.max(conv_out, dim=2)
+            
+            conv_outs.append(conv_out)
+
+        # batch_size, out_channels*len(kernel_weights), 1
+        conv_out = torch.cat(conv_outs, dim=1)
+        conv_out = torch.squeeze(conv_out)
+        conv_out = self.dropout(conv_out)
+        # batch_size, out_channels*len(kernel_weights)
+        conv_out = conv_out.view(X.shape[0], -1)
+        
+        fc_out = self.fc1(conv_out)
+        logits = fc_out
+        #logits = self.softmax(fc_out)
         
         return logits
-
-dataset = QuoraInsinereQustion('data/train')
-train_dl = DataLoader(
-    dataset=dataset,
-    batch_size=batch_size,
-    shuffle=shuffle,
-    num_workers=num_workers
-)
-
-from torch.nn import CrossEntropyLoss
-from torch.optim import Adam, SGD
-model = CNN()
-#loss = CrossEntropyLoss()
-loss = CrossEntropyLoss(weight=torch.Tensor([1, 16]))
-trainable_tensors = [p[1] for p in model.named_parameters() if p[0].startswith('cnn') or p[0].startswith('fc')]
-optimizer = Adam(params=trainable_tensors, lr=learning_rate)
-
-from ignite.engine import create_supervised_trainer, Events, create_supervised_evaluator
-from ignite.metrics import Loss, Accuracy
-trainer = create_supervised_trainer(model=model, optimizer=optimizer, loss_fn=loss)
-
-@trainer.on(Events.EPOCH_COMPLETED)
-def log_training_loss(trainer):
-    evaluator.run(train_dl)
-    metrics.add_train(evaluator.state.metrics)
-
-    global epoch_st
-    elasped_time = int(time()-epoch_st)
-    epoch_st = time()
-
-    print(f"epoch {trainer.state.epoch} {evaluator.state.metrics} {elasped_time}")
-
-trainer.run(train_dl, max_epochs=5)

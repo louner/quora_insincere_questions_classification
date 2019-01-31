@@ -1,41 +1,3 @@
-'''
-import pandas as pd
-
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import precision_score, recall_score, f1_score
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-
-def prepare_train_val():
-    train = pd.read_csv('data/train.csv')
-    train, val = train_test_split(train, test_size=0.2)
-    train.to_csv('data/train')
-    val.to_csv('data/val')
-
-def evaluate(df):
-    val_X, val_y = tfidf.transform(df['question_text']), df['target']
-    pred = cls.predict(val_X)
-    print(precision_score(pred, val_y), recall_score(pred, val_y), f1_score(pred, val_y))
-
-
-def train_tfidf(X):
-    tfidf = TfidfVectorizer(ngram_range=(1,2))
-    tfidf.fit(X)
-    return tfidf
-
-def build_embed_layer():
-    glove = pd.read_csv('data/glove.840B.300d/glove.840B.300d.txt', sep=' ')
-    words = glove.iloc[:, 0]
-    word2id = {}
-    for word in words:
-        word2id[word] = len(word2id)
-        
-    embeddings = glove.iloc[:, 1:].values
-    embed_layer = Embedding.from_pretrained(torch.Tensor(embeddings))
-    return word2id, embed_layer
-'''
-
 from torch.nn import Embedding
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -52,8 +14,17 @@ import matplotlib.pyplot as plt
 from IPython import display
 from time import time
 
+from torch.nn import CrossEntropyLoss
+from torch.optim import Adam, SGD
+
+from ignite.engine import create_supervised_trainer, Events, create_supervised_evaluator
+from ignite.metrics import Loss, Accuracy, Precision, Recall
+
+from gensim.utils import tokenize
+from imblearn.over_sampling import RandomOverSampler
+
 word2id_fpath = 'data/word2id'
-batch_size = 256
+batch_size = 512
 shuffle = True
 num_workers = 4
 sentence_length = 32
@@ -62,28 +33,31 @@ learning_rate = 1e-3
 kernel_weights = [2,3,4]
 out_channels = 8
 
+def load_dictionary():
+    with open(word2id_fpath) as f:
+        dictionary = json.load(f)
+    return dictionary
+
 class TokToID(object):
-    def __init__(self, tokenizer=None):
-        if tokenizer is None:
-            tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-        self.tokenizer = tokenizer
-    
+    def __init__(self, dictionary):
+        self.dictionary = dictionary
+
     def toID(self, sentence):
         try:
             #set_trace()
-            toks = self.tokenizer.tokenize(sentence)
-            ids = self.tokenizer.convert_tokens_to_ids(toks)
+            ids = [self.dictionary.get(tok, -1) for tok in tokenize(sentence)]
+            ids = [id for id in ids if id >= 0]
             return ids
         except:
             set_trace()
-        
+
     def __call__(self, item):
         item[0] = self.toID(item[0])
         return item
 
 class ToTensor:
     def __init__(self):
-        pass
+       pass
     
     def __call__(self, item):
         item[0] = torch.from_numpy(np.array(item[0]))
@@ -105,14 +79,21 @@ class FixSentencesLength(object):
         return item
 
 class QuoraInsinereQustion(Dataset):
-    def __init__(self, fpath):
-        self.df = pd.read_csv(fpath)
+    def __init__(self, fpath, over_sample=False):
+        df = pd.read_csv(fpath)
+        if over_sample:
+            ros = RandomOverSampler()
+            X, _ = ros.fit_resample(df, df['target'])
+            self.df = pd.DataFrame(X, columns=df.columns)
+        else:
+            self.df = df
+        
         self.transform = transforms.Compose([
-            TokToID(),
+            TokToID(load_dictionary()),
             FixSentencesLength(),
             ToTensor()
         ])
-        
+
     def __len__(self):
         return self.df.shape[0]
 
@@ -126,7 +107,6 @@ class QuoraInsinereQustion(Dataset):
                 print(sample)
                 raise
         return sample
-
 class Metrics:
     def __init__(self):
         self.train_metrics = pd.DataFrame()
@@ -173,67 +153,8 @@ def plot_metrics(metrics):
     display.display(plt.gcf())
     display.clear_output(wait=True)
 
-class CNN(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        
-        self.bert_model = BertModel.from_pretrained('bert-base-uncased')
-        for p in self.bert_model.parameters():
-            p.requires_grad = False
-        
-        self.convs = []
-        for kernel_weight in kernel_weights:
-            conv = torch.nn.Conv2d(
-                in_channels=1,
-                out_channels=out_channels,
-                kernel_size=(kernel_weight, bert_hidden_size)
-            )
-            self.convs.append(conv)
-            setattr(self, 'conv-%d'%(kernel_weight), conv)
-        
-        self.dropout = torch.nn.Dropout(p=0.5)
-        
-        self.fc1 = torch.nn.Linear(
-            in_features=len(kernel_weights)*out_channels,
-            out_features=2
-        )
-        
-        self.softmax = torch.nn.Softmax(dim=1)
-        
-    def forward(self, X):
-        #set_trace()
-        segment_tensor = torch.zeros_like(X)
-        # 12, sentence_length, 768
-        encoder, _ = self.bert_model(X, segment_tensor)
-
-        last_layer = encoder[-1]
-        # for cnn (N, C, H, W) format, append in_channel in dim=1
-        last_layer = torch.unsqueeze(last_layer, 1)
-        #last_layer = self.dropout(last_layer)
-        
-        conv_outs = []
-        for conv in self.convs:
-            # batch_size, out_channels, sentence_length-kernel_weight+1, 1
-            conv_out = conv(last_layer)
-            # batch_size, out_channels, 1
-            # dim=2 is maxed out
-            conv_out, _ = torch.max(conv_out, dim=2)
-            
-            conv_outs.append(conv_out)
-
-        # batch_size, out_channels*len(kernel_weights), 1
-        conv_out = torch.cat(conv_outs, dim=1)
-        conv_out = torch.squeeze(conv_out)
-        # batch_size, out_channels*len(kernel_weights)
-        conv_out = conv_out.view(X.shape[0], -1)
-        
-        fc_out = self.fc1(conv_out)
-        logits = self.softmax(fc_out)
-        
-        return logits
-            
-def build_dl(fpath, frac=0.00001):
-    dataset = QuoraInsinereQustion(fpath)
+def build_dl(fpath, frac=0.00001, over_sample=False):
+    dataset = QuoraInsinereQustion(fpath, over_sample)
     dataset.df = dataset.df.sample(frac=frac)
     dl = DataLoader(
         dataset=dataset,
@@ -243,21 +164,12 @@ def build_dl(fpath, frac=0.00001):
     )
     return dl
 
-if __name__ == '__main__':
-    from torch.nn import CrossEntropyLoss
-    from torch.optim import Adam, SGD
-
-    train_dl = build_dl('data/train', frac=0.0001)
-    val_dl = build_dl('data/val', frac=0.0001)
-
-    model = CNN()
+def train(model, train_dl, val_dl):
     #loss = CrossEntropyLoss()
-    loss = CrossEntropyLoss(weight=torch.Tensor([1, 16]))
+    loss = loss = CrossEntropyLoss()
     trainable_tensors = [p[1] for p in model.named_parameters() if p[0].startswith('conv') or p[0].startswith('fc')]
     optimizer = Adam(params=trainable_tensors, lr=learning_rate)
 
-    from ignite.engine import create_supervised_trainer, Events, create_supervised_evaluator
-    from ignite.metrics import Loss, Accuracy, Precision, Recall
     trainer = create_supervised_trainer(model=model, optimizer=optimizer, loss_fn=loss)
     evaluator = create_supervised_evaluator(model=model, metrics={'Loss': Loss(loss), 'Accuracy': Accuracy(), 'Precision': Precision(), 'Recall': Recall()})
     metrics = Metrics()

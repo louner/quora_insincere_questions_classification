@@ -1,0 +1,3 @@
+[submodule "attention-is-all-you-need-pytorch"]
+	path = attention-is-all-you-need-pytorch
+	url = https://github.com/jadore801120/attention-is-all-you-need-pytorch
