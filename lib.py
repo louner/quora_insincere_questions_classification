@@ -79,7 +79,7 @@ class FixSentencesLength(object):
         return item
 
 class QuoraInsinereQustion(Dataset):
-    def __init__(self, fpath, over_sample=False):
+    def __init__(self, fpath, over_sample=False, transform=None):
         df = pd.read_csv(fpath)
         if over_sample:
             ros = RandomOverSampler()
@@ -88,11 +88,14 @@ class QuoraInsinereQustion(Dataset):
         else:
             self.df = df
         
-        self.transform = transforms.Compose([
-            TokToID(load_dictionary()),
-            FixSentencesLength(),
-            ToTensor()
-        ])
+        if transform is None:
+            self.transform = transforms.Compose([
+                TokToID(load_dictionary()),
+                FixSentencesLength(sentence_length),
+                ToTensor()
+            ])
+        else:
+            self.transform = transform
 
     def __len__(self):
         return self.df.shape[0]
@@ -153,8 +156,8 @@ def plot_metrics(metrics):
     display.display(plt.gcf())
     display.clear_output(wait=True)
 
-def build_dl(fpath, frac=0.00001, over_sample=False):
-    dataset = QuoraInsinereQustion(fpath, over_sample)
+def build_dl(fpath, frac=0.00001, over_sample=False, transform=None):
+    dataset = QuoraInsinereQustion(fpath, over_sample=over_sample, transform=transform)
     dataset.df = dataset.df.sample(frac=frac)
     dl = DataLoader(
         dataset=dataset,
