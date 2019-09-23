@@ -23,19 +23,62 @@ from ignite.metrics import Loss, Accuracy, Precision, Recall
 from gensim.utils import tokenize
 from imblearn.over_sampling import RandomOverSampler
 
-word2id_fpath = 'data/word2id'
+from gensim.corpora import Dictionary
+from gensim.utils import tokenize
+
+dictionary_path = 'data/dictionary'
 batch_size = 512
 shuffle = True
 num_workers = 4
-sentence_length = 32
+sentence_length = 128
 bert_hidden_size = 768
 learning_rate = 1e-3
 kernel_weights = [2,3,4]
 out_channels = 8
 
+def build_dictionary(train_path, test_path, no_below=2, keep_n=2000000):
+    train, test = pd.read_csv(train_path), pd.read_csv(test_path)
+    df = pd.concat([train, test])
+    sentences = df['question_text'].values
+
+    documents = [list(tokenize(sentence)) for sentence in sentences]
+    dictionary = Dictionary(documents=documents)
+
+    dictionary.filter_extremes(no_below=no_below, keep_n=keep_n)
+    dictionary.save(dictionary_fpath)
+    return dictionary
+
+def build_glove_embed(glove_path, dictionary):
+    glove = pd.read_csv(glove_path, sep=' ')
+    glove_word2id = dict([(word, id) for id,word in enumerate(glove.iloc[:, 0])])
+    glove_embeddings = glove.iloc[:, 1:].values
+    
+    word2id = {}
+    absent_words = []
+    embeddings = deque()
+    for word in dictionary.token2id:
+        if word in glove_word2id:
+            word2id[word] = len(word2id)
+            embeddings.append(glove_embeddings[glove_word2id[word]])
+            
+        else:
+            absent_words.append(word)
+            
+    embeddings = list(embeddings)
+    
+    for word in absent_words:
+        word2id[word] = len(word2id)
+
+    mean, std = np.mean(embeddings, axis=0), np.std(embeddings, axis=0)
+    absent_words_embeddings = np.random.normal(loc=mean, scale=std, size=(len(absent_words), embed_dim))
+    embeddings = np.concatenate([embeddings,absent_words_embeddings], axis=0)
+    print(len(word2id), embeddings.shape)
+
+    embed_layer = torch.nn.Embedding.from_pretrained(torch.FloatTensor(embeddings))
+    torch.save(embed_layer, embed_layer_fpath)
+
 def load_dictionary():
-    with open(word2id_fpath) as f:
-        dictionary = json.load(f)
+    dictionary = Dictionary().load(dictionary_path)
     return dictionary
 
 class TokToID(object):
@@ -45,7 +88,7 @@ class TokToID(object):
     def toID(self, sentence):
         try:
             #set_trace()
-            ids = [self.dictionary.get(tok, -1) for tok in tokenize(sentence)]
+            ids = [self.dictionary.token2id.get(tok, -1) for tok in tokenize(sentence)]
             ids = [id for id in ids if id >= 0]
             return ids
         except:
